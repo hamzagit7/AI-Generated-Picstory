@@ -11,12 +11,86 @@ import logging
 import subprocess
 import imghdr
 from reverie_sdk import ReverieClient
-import speech_recognition as sr
 import re
 import moviepy.config as mp_config
 from concurrent.futures import ThreadPoolExecutor
 import time
-import keyboard
+import threading
+import sounddevice as sd
+import numpy as np
+import wave
+import google.generativeai as genai
+import tempfile
+import uuid
+
+# === PAGE CONFIG ===
+st.set_page_config(layout="wide")
+
+# === FUNCTION TO SET BACKGROUND IMAGE WITH DARK OVERLAY ===
+def set_bg_image(image_path):
+    try:
+        with open(image_path, "rb") as img_file:
+            img_bytes = img_file.read()
+            encoded = base64.b64encode(img_bytes).decode()
+        page_bg_img = f"""
+        <style>
+        .stApp {{
+            background: linear-gradient(
+                rgba(0, 0, 0, 0.65), 
+                rgba(0, 0, 0, 0.65)
+            ), url("data:image/png;base64,{encoded}");
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            font-family: 'Segoe UI', 'Helvetica Neue', sans-serif;
+        }}
+        h1, h2, h3, h4, h5, h6 {{
+            color: #ffffff !important;
+            text-shadow: 2px 2px 8px rgba(0,0,0,0.9);
+        }}
+        .stMarkdown, label, .stTextInput > label, .stTextArea > label {{
+            color: #e0e0e0 !important;
+            text-shadow: 1px 1px 3px rgba(0,0,0,0.8);
+        }}
+        .stTextArea textarea {{
+            background-color: rgba(255, 255, 255, 0.95);
+            color: #000;
+            font-size: 16px;
+            border-radius: 8px;
+            padding: 10px;
+        }}
+        .stFileUploader {{
+            background-color: rgba(255,255,255,0.95);
+            border-radius: 10px;
+            padding: 15px;
+            font-weight: bold;
+        }}
+        .stSelectbox > div {{
+            background-color: rgba(255,255,255,0.95) !important;
+            color: #000000 !important;
+        }}
+        .stButton button {{
+            background-color: #FF4081;
+            color: #ffffff;
+            padding: 12px 26px;
+            border: none;
+            border-radius: 12px;
+            font-size: 17px;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 4px 4px 10px rgba(0,0,0,0.4);
+        }}
+        .stButton button:hover {{
+            background-color: #F50057;
+        }}
+        </style>
+        """
+        st.markdown(page_bg_img, unsafe_allow_html=True)
+    except FileNotFoundError:
+        logger.error(f"Background image not found at {image_path}")
+
+# === SET BACKGROUND ===
+set_bg_image("C:\\Users\\ADARSH KUMAR\\Downloads\\Ai_background.jpg")
 
 # Set ImageMagick path
 mp_config.IMAGEMAGICK_BINARY = r"C:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe"
@@ -46,21 +120,26 @@ for folder in [UPLOAD_FOLDER, EXTRACT_FOLDER, OUTPUT_FOLDER, TEMP_FOLDER]:
 # MySQL Database Configuration
 db_config = {
     'user': 'root',
-    'password': '',
+    'password': 'Hamzavsu777',
     'host': 'localhost',
-    'database': 'pictory_db'
+    'database': 'picstory_db'
 }
 
 # API Configuration
-GEMINI_API_KEY = "AIzaSyBnrZ6cb6whzoOfCZ0XHEgjzkO555ELCAM"
+PRIMARY_GEMINI_API_KEY = "AIzaSyBnrZ6cb6whzoOfCZ0XHEgjzkO555ELCAM"
+BACKUP_GEMINI_API_KEY = "AIzaSyAh2GZHOXBWeYisLsUXBn5ZI--bipXy63g"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
 GEMINI_API_VERSION = "v1"
 GEMINI_MODEL = "gemini-1.5-flash"
 
+# Configure Gemini API
+genai.configure(api_key=PRIMARY_GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
+
 # Initialize Reverie client
 reverie_client = ReverieClient(
-    api_key="5d9ef1b241e043cd692a0ae4f188e1b18985b141",
-    app_id="com.adarshk0904",
+    api_key="586ee9a23c1ff03d671a827feec74dad7b357564",
+    app_id="dev.2023preethi_verma",
 )
 
 # Supported languages
@@ -89,20 +168,6 @@ SUPPORTED_LANGUAGES = {
     "22": {"code": "ne-IN", "name": "Nepali", "rev_code": "ne", "speakers": ["ne_male", "ne_female"]},
     "23": {"code": "sat-IN", "name": "Santali", "rev_code": "en", "speakers": ["en_male", "en_female"]},
 }
-
-# Custom CSS for better UI
-st.markdown("""
-    <style>
-    .main {background-color: #f0f2f6;}
-    .stButton>button {background-color: #4CAF50; color: white; border-radius: 5px;}
-    .stTextInput>input, .stTextArea>textarea {border-radius: 5px; border: 1px solid #ccc;}
-    .stSelectbox>div {background-color: #fff; border-radius: 5px;}
-    .recording-feedback {font-size: 16px; color: #FF5733; font-weight: bold; animation: blink 1s infinite;}
-    @keyframes blink {
-        50% {opacity: 0;}
-    }
-    </style>
-""", unsafe_allow_html=True)
 
 # Database connection
 db_conn = None
@@ -136,7 +201,7 @@ def init_db():
         ''')
         db_conn.commit()
         logger.info("Database connection established and tables created.")
-        st.success("Database connection established and tables created.")
+        st.success("✅ Database connection established and tables created.")
     except mysql.connector.Error as e:
         logger.error(f"Database connection failed: {str(e)}")
         st.error(f"Database connection failed: {str(e)}")
@@ -164,24 +229,47 @@ def login(username, password):
 
 @st.cache_data
 def process_input(text_input, media_paths=None):
-    if not text_input or text_input == "Example description or no description":
-        text_input = "A journey through the snowy mountains of Manali in December."
+    if not text_input or text_input == "Enter The Description":
+        text_input = "A journey through breathtaking landscapes during a memorable trip."
     detected_lang = "en"
     gemini_url = f"{GEMINI_BASE_URL}/{GEMINI_API_VERSION}/models/{GEMINI_MODEL}:generateContent"
+    api_keys = [PRIMARY_GEMINI_API_KEY, BACKUP_GEMINI_API_KEY]
+    current_key_idx = 0
     try:
         headers = {"Content-Type": "application/json"}
         payload = {
             "contents": [{"parts": [{"text": f"Detect the language of the following text and return the language code (e.g., 'en', 'hi'): {text_input}"}]}],
             "generationConfig": {"maxOutputTokens": 10}
         }
-        response = requests.post(f"{gemini_url}?key={GEMINI_API_KEY}", json=payload, headers=headers)
-        response.raise_for_status()
-        detected_lang = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "en")
-        if detected_lang not in [lang["rev_code"] for lang in SUPPORTED_LANGUAGES.values()]:
-            detected_lang = "en"
-        logger.info(f"Detected language from text: {detected_lang}")
-    except requests.RequestException as e:
-        logger.error(f"Failed to detect language: {str(e)}")
+        while current_key_idx < len(api_keys):
+            try:
+                response = requests.post(f"{gemini_url}?key={api_keys[current_key_idx]}", json=payload, headers=headers)
+                response.raise_for_status()
+                detected_lang = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "en")
+                if detected_lang not in [lang["rev_code"] for lang in SUPPORTED_LANGUAGES.values()]:
+                    detected_lang = "en"
+                logger.info(f"Detected language from text with key {api_keys[current_key_idx]}: {detected_lang}")
+                break
+            except requests.exceptions.HTTPError as e:
+                if response.status_code == 429:
+                    logger.warning(f"Rate limit exceeded with API key {api_keys[current_key_idx]}. Switching to backup...")
+                    current_key_idx += 1
+                    if current_key_idx < len(api_keys):
+                        time.sleep(1)
+                        continue
+                    else:
+                        logger.error(f"All API keys exhausted: {str(e)}")
+                        break
+                else:
+                    logger.error(f"Failed to detect language with key {api_keys[current_key_idx]}: {str(e)}")
+                    break
+            except requests.RequestException as e:
+                logger.error(f"Failed to detect language with key {api_keys[current_key_idx]}: {str(e)}")
+                break
+        else:
+            logger.warning("Defaulting to English due to API failures.")
+    except Exception as e:
+        logger.error(f"Unexpected error in process_input: {str(e)}")
         logger.warning("Defaulting to English.")
     if media_paths:
         for media_path in media_paths:
@@ -193,22 +281,44 @@ def process_input(text_input, media_paths=None):
                     "contents": [{"parts": [{"inline_data": {"mime_type": mime_type, "data": file_content}}, {"text": "Detect the language of any text in this media. Return the language code (e.g., 'hi', 'en')."}]}],
                     "generationConfig": {"maxOutputTokens": 10}
                 }
-                response = requests.post(f"{gemini_url}?key={GEMINI_API_KEY}", json=payload, headers=headers)
-                response.raise_for_status()
-                media_detected_lang = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "en")
-                if media_detected_lang not in [lang["rev_code"] for lang in SUPPORTED_LANGUAGES.values()]:
-                    media_detected_lang = "en"
-                logger.info(f"Detected language from media {media_path}: {media_detected_lang}")
-                if media_detected_lang != "en":
-                    detected_lang = media_detected_lang
-                    break
-            except requests.RequestException as e:
-                logger.error(f"Failed to detect language from media {media_path}: {str(e)}")
+                current_key_idx = 0
+                while current_key_idx < len(api_keys):
+                    try:
+                        response = requests.post(f"{gemini_url}?key={api_keys[current_key_idx]}", json=payload, headers=headers)
+                        response.raise_for_status()
+                        media_detected_lang = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "en")
+                        if media_detected_lang not in [lang["rev_code"] for lang in SUPPORTED_LANGUAGES.values()]:
+                            media_detected_lang = "en"
+                        logger.info(f"Detected language from media {media_path} with key {api_keys[current_key_idx]}: {media_detected_lang}")
+                        if media_detected_lang != "en":
+                            detected_lang = media_detected_lang
+                            break
+                        break
+                    except requests.exceptions.HTTPError as e:
+                        if response.status_code == 429:
+                            logger.warning(f"Rate limit exceeded with API key {api_keys[current_key_idx]} for media {media_path}. Switching to backup...")
+                            current_key_idx += 1
+                            if current_key_idx < len(api_keys):
+                                time.sleep(1)
+                                continue
+                            else:
+                                logger.error(f"All API keys exhausted for media {media_path}: {str(e)}")
+                                break
+                        else:
+                            logger.error(f"Failed to detect language from media {media_path} with key {api_keys[current_key_idx]}: {str(e)}")
+                            break
+                    except requests.RequestException as e:
+                        logger.error(f"Failed to detect language from media {media_path} with key {api_keys[current_key_idx]}: {str(e)}")
+                        break
+            except Exception as e:
+                logger.error(f"Unexpected error processing media {media_path}: {str(e)}")
     return text_input, detected_lang
 
 @st.cache_data
 def analyze_single_image(image_path, mime_type="image/jpeg"):
     gemini_url = f"{GEMINI_BASE_URL}/{GEMINI_API_VERSION}/models/{GEMINI_MODEL}:generateContent"
+    api_keys = [PRIMARY_GEMINI_API_KEY, BACKUP_GEMINI_API_KEY]
+    current_key_idx = 0
     headers = {"Content-Type": "application/json"}
     try:
         with open(image_path, "rb") as file:
@@ -217,32 +327,51 @@ def analyze_single_image(image_path, mime_type="image/jpeg"):
             "contents": [{"parts": [{"inline_data": {"mime_type": mime_type, "data": file_content}}, {"text": "Describe this image in a short sentence in English."}]}],
             "generationConfig": {"maxOutputTokens": 50}
         }
-        response = requests.post(f"{gemini_url}?key={GEMINI_API_KEY}", json=payload, headers=headers)
-        response.raise_for_status()
-        description = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-        logger.info(f"Image description for {image_path}: {description}")
-        return description
-    except requests.RequestException as e:
-        logger.error(f"Image analysis failed for {image_path}: {str(e)}")
+        while current_key_idx < len(api_keys):
+            try:
+                response = requests.post(f"{gemini_url}?key={api_keys[current_key_idx]}", json=payload, headers=headers)
+                response.raise_for_status()
+                description = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                logger.info(f"Image description for {image_path} with key {api_keys[current_key_idx]}: {description}")
+                time.sleep(1)
+                return description
+            except requests.exceptions.HTTPError as e:
+                if response.status_code == 429:
+                    logger.warning(f"Rate limit exceeded with API key {api_keys[current_key_idx]} for image {image_path}. Switching to backup...")
+                    current_key_idx += 1
+                    if current_key_idx < len(api_keys):
+                        time.sleep(1)
+                        continue
+                    else:
+                        logger.error(f"All API keys exhausted for image {image_path}: {str(e)}")
+                        break
+                else:
+                    logger.error(f"Image analysis failed for {image_path} with key {api_keys[current_key_idx]}: {str(e)}")
+                    break
+            except requests.RequestException as e:
+                logger.error(f"Image analysis failed for {image_path} with key {api_keys[current_key_idx]}: {str(e)}")
+                break
+        return "Failed to analyze image."
+    except Exception as e:
+        logger.error(f"Unexpected error analyzing image {image_path}: {str(e)}")
         return "Failed to analyze image."
 
 @st.cache_data
 def analyze_single_video(video_path):
     gemini_url = f"{GEMINI_BASE_URL}/{GEMINI_API_VERSION}/models/{GEMINI_MODEL}:generateContent"
+    api_keys = [PRIMARY_GEMINI_API_KEY, BACKUP_GEMINI_API_KEY]
+    current_key_idx = 0
     headers = {"Content-Type": "application/json"}
     try:
-        # Extract frames from video
         clip = mp.VideoFileClip(video_path)
         duration = clip.duration
-        frame_interval = max(1, duration / 3)  # Extract up to 3 frames, at least 1 second apart
+        frame_interval = max(1, duration / 3)
         frame_paths = []
         for t in [frame_interval * i for i in range(min(3, int(duration // frame_interval) + 1))]:
             frame_path = os.path.join(TEMP_FOLDER, f"frame_{os.path.basename(video_path)}_{t}.jpg")
             clip.save_frame(frame_path, t=t)
             frame_paths.append(frame_path)
         clip.close()
-
-        # Analyze frames
         frame_descriptions = []
         for frame_path in frame_paths:
             with open(frame_path, "rb") as file:
@@ -251,12 +380,32 @@ def analyze_single_video(video_path):
                 "contents": [{"parts": [{"inline_data": {"mime_type": "image/jpeg", "data": file_content}}, {"text": "Describe this frame from a video in a short sentence in English."}]}],
                 "generationConfig": {"maxOutputTokens": 50}
             }
-            response = requests.post(f"{gemini_url}?key={GEMINI_API_KEY}", json=payload, headers=headers)
-            response.raise_for_status()
-            desc = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-            frame_descriptions.append(desc)
-        
-        # Combine into a single description
+            current_key_idx = 0
+            while current_key_idx < len(api_keys):
+                try:
+                    response = requests.post(f"{gemini_url}?key={api_keys[current_key_idx]}", json=payload, headers=headers)
+                    response.raise_for_status()
+                    desc = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    frame_descriptions.append(desc)
+                    logger.info(f"Frame description for {frame_path} with key {api_keys[current_key_idx]}: {desc}")
+                    time.sleep(1)
+                    break
+                except requests.exceptions.HTTPError as e:
+                    if response.status_code == 429:
+                        logger.warning(f"Rate limit exceeded with API key {api_keys[current_key_idx]} for video frame {frame_path}. Switching to backup...")
+                        current_key_idx += 1
+                        if current_key_idx < len(api_keys):
+                            time.sleep(1)
+                            continue
+                        else:
+                            logger.error(f"All API keys exhausted for video frame {frame_path}: {str(e)}")
+                            break
+                    else:
+                        logger.error(f"Failed to analyze frame {frame_path} with key {api_keys[current_key_idx]}: {str(e)}")
+                        break
+                except requests.RequestException as e:
+                    logger.error(f"Failed to analyze frame {frame_path} with key {api_keys[current_key_idx]}: {str(e)}")
+                    break
         combined_desc = " ".join(frame_descriptions)
         logger.info(f"Video description for {video_path}: {combined_desc}")
         return combined_desc
@@ -267,46 +416,89 @@ def analyze_single_video(video_path):
 @st.cache_data
 def generate_continuous_story(media_descriptions, user_description, output_language_code, detected_lang, num_segments):
     gemini_url = f"{GEMINI_BASE_URL}/{GEMINI_API_VERSION}/models/{GEMINI_MODEL}:generateContent"
+    api_keys = [PRIMARY_GEMINI_API_KEY, BACKUP_GEMINI_API_KEY]
+    current_key_idx = 0
     headers = {"Content-Type": "application/json"}
     target_lang = output_language_code.split('-')[0]
     media_desc_text = "\n".join([f"Media {i+1}: {desc}" for i, desc in enumerate(media_descriptions)])
-    prompt = f"Based on the following user description: '{user_description}', and the descriptions of {num_segments} media items (images or videos):\n{media_desc_text}\nGenerate a continuous story in {target_lang} that flows naturally across the media, describing a journey in Manali in December. The story should be cohesive, reflecting the specific details of each media item in sequence, and should include a narrative arc with a beginning, middle, and end. Split the story into exactly {num_segments} non-empty parts, each corresponding to one media item. Each part should be a concise sentence of 15-20 words, suitable for narration within 8 seconds at a normal speaking pace (120-150 words per minute). Ensure each part builds on the previous part and maintains the context of a journey. Return the parts as a list separated by newlines, without any numbering or labels."
+    prompt = f"Based on the following user description: '{user_description}', and the descriptions of {num_segments} media items (images or videos):\n{media_desc_text}\nGenerate a continuous story in {target_lang} that flows naturally across the media, describing a journey. The story should be cohesive, reflecting the specific details of each media item in sequence, and should include a narrative arc with a beginning, middle, and end. Split the story into exactly {num_segments} non-empty parts, each corresponding to one media item. Each part should be a concise sentence of 12-16 words, suitable for narration within 6 seconds at a normal speaking pace (120-150 words per minute). Ensure each part builds on the previous part and maintains the context of a journey. Return the parts as a list separated by newlines, without any numbering or labels."
     payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 500}}
     for attempt in range(3):
-        try:
-            response = requests.post(f"{gemini_url}?key={GEMINI_API_KEY}", json=payload, headers=headers)
-            response.raise_for_status()
-            story_text = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-            story_segments = [segment.strip() for segment in story_text.split("\n") if segment.strip()]
-            cleaned_segments = [re.sub(r'^\d+\.\s*|\d+\s*', '', segment).strip() for segment in story_segments if re.sub(r'^\d+\.\s*|\d+\s*', '', segment).strip()]
-            if len(cleaned_segments) != num_segments:
-                logger.warning(f"Expected {num_segments} segments, got {len(cleaned_segments)}. Retrying...")
-                continue
-            logger.info(f"Generated story segments: {cleaned_segments}")
-            return cleaned_segments
-        except requests.RequestException as e:
-            logger.error(f"Story generation failed (attempt {attempt + 1}): {str(e)}")
+        while current_key_idx < len(api_keys):
+            try:
+                response = requests.post(f"{gemini_url}?key={api_keys[current_key_idx]}", json=payload, headers=headers)
+                response.raise_for_status()
+                story_text = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                story_segments = [segment.strip() for segment in story_text.split("\n") if segment.strip()]
+                cleaned_segments = [re.sub(r'^\d+\.\s*|\d+\s*', '', segment).strip() for segment in story_segments if re.sub(r'^\d+\.\s*|\d+\s*', '', segment).strip()]
+                if len(cleaned_segments) != num_segments:
+                    logger.warning(f"Expected {num_segments} segments, got {len(cleaned_segments)}. Retrying...")
+                    continue
+                logger.info(f"Generated story segments with key {api_keys[current_key_idx]}: {cleaned_segments}")
+                time.sleep(1)
+                return cleaned_segments
+            except requests.exceptions.HTTPError as e:
+                if response.status_code == 429:
+                    logger.warning(f"Rate limit exceeded with API key {api_keys[current_key_idx]} (attempt {attempt + 1}). Switching to backup...")
+                    current_key_idx += 1
+                    if current_key_idx < len(api_keys):
+                        time.sleep(1)
+                        continue
+                    else:
+                        logger.error(f"All API keys exhausted (attempt {attempt + 1}): {str(e)}")
+                        break
+                else:
+                    logger.error(f"Story generation failed with key {api_keys[current_key_idx]} (attempt {attempt + 1}): {str(e)}")
+                    break
+            except requests.RequestException as e:
+                logger.error(f"Story generation failed with key {api_keys[current_key_idx]} (attempt {attempt + 1}): {str(e)}")
+                break
+        if current_key_idx >= len(api_keys):
             if attempt == 2:
-                st.error("Failed to generate story after multiple attempts. Please try again.")
+                st.error("Failed to generate story after multiple attempts with all API keys. Please try again.")
                 return None
-    story_segments = [f"In {target_lang}, we continued our journey in Manali, enjoying the scenery of media {i+1}." for i in range(num_segments)]
+            current_key_idx = 0
+    story_segments = [f"In {target_lang}, we continued our journey, enjoying the scenery of media {i+1}." for i in range(num_segments)]
     logger.warning("Using fallback story segments due to repeated failures.")
     return story_segments
 
 def translate_text(text, source_lang, target_lang):
     gemini_url = f"{GEMINI_BASE_URL}/{GEMINI_API_VERSION}/models/{GEMINI_MODEL}:generateContent"
+    api_keys = [PRIMARY_GEMINI_API_KEY, BACKUP_GEMINI_API_KEY]
+    current_key_idx = 0
     headers = {"Content-Type": "application/json"}
     prompt = f"Translate the following text from {source_lang} to {target_lang}: '{text}'"
     payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 100}}
     try:
-        response = requests.post(f"{gemini_url}?key={GEMINI_API_KEY}", json=payload, headers=headers)
-        response.raise_for_status()
-        translated_text = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", text)
-        logger.info(f"Translated text from {source_lang} to {target_lang}: {translated_text}")
-        return translated_text
-    except requests.RequestException as e:
-        logger.error(f"Translation failed: {str(e)}")
-        st.error(f"Translation failed: {str(e)}. Using original text as fallback.")
+        while current_key_idx < len(api_keys):
+            try:
+                response = requests.post(f"{gemini_url}?key={api_keys[current_key_idx]}", json=payload, headers=headers)
+                response.raise_for_status()
+                translated_text = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", text)
+                logger.info(f"Translated text from {source_lang} to {target_lang} with key {api_keys[current_key_idx]}: {translated_text}")
+                time.sleep(1)
+                return translated_text
+            except requests.exceptions.HTTPError as e:
+                if response.status_code == 429:
+                    logger.warning(f"Rate limit exceeded with API key {api_keys[current_key_idx]}. Switching to backup...")
+                    current_key_idx += 1
+                    if current_key_idx < len(api_keys):
+                        time.sleep(1)
+                        continue
+                    else:
+                        logger.error(f"All API keys exhausted: {str(e)}")
+                        break
+                else:
+                    logger.error(f"Translation failed with key {api_keys[current_key_idx]}: {str(e)}")
+                    break
+            except requests.RequestException as e:
+                logger.error(f"Translation failed with key {api_keys[current_key_idx]}: {str(e)}")
+                break
+        st.error(f"Translation failed with all API keys. Using original text as fallback.")
+        return text
+    except Exception as e:
+        logger.error(f"Unexpected error in translate_text: {str(e)}")
+        st.error(f"Translation failed unexpectedly. Using original text as fallback.")
         return text
 
 def generate_tts_audio(text, output_path, language_code, voice="female"):
@@ -321,11 +513,11 @@ def generate_tts_audio(text, output_path, language_code, voice="female"):
         logger.info(f"Generated audio at {output_path} in {rev_lang} with {speaker}")
         return True
     except Exception as e:
-        logger.error(f"TTS Error: {str(e)}")
-        st.error(f"Failed to generate audio narration: {str(e)}")
+        logger.error(f"TTS Error for {output_path}: {str(e)}")
+        st.error(f"Failed to generate audio narration for {output_path}: {str(e)}")
         return False
 
-def create_video_snippet(media_path, audio_path, output_path, text, duration=8):
+def create_video_snippet(media_path, audio_path, output_path, text, duration=6):
     try:
         if not os.path.exists(media_path):
             logger.error(f"Media file does not exist: {media_path}")
@@ -346,9 +538,16 @@ def create_video_snippet(media_path, audio_path, output_path, text, duration=8):
             logger.error(f"Unsupported media type: {media_path}")
             return False
 
-        audio = mp.AudioFileClip(audio_path)
-        final_duration = min(duration, audio.duration, media_clip.duration if media_path.lower().endswith('.mp4') else duration)
-        audio = audio.subclip(0, final_duration)
+        if os.path.exists(audio_path):
+            audio = mp.AudioFileClip(audio_path)
+            final_duration = min(duration, audio.duration, media_clip.duration if media_path.lower().endswith('.mp4') else duration)
+            audio = audio.subclip(0, final_duration)
+            logger.info(f"Loaded audio for {output_path} with duration {final_duration}")
+        else:
+            logger.warning(f"Audio file {audio_path} not found for {output_path}. Video will be silent.")
+            audio = None
+            final_duration = duration
+
         media_clip = media_clip.set_duration(final_duration)
         logger.info(f"Loaded media: {media_path}, duration: {final_duration}")
 
@@ -363,18 +562,22 @@ def create_video_snippet(media_path, audio_path, output_path, text, duration=8):
                 method='caption'
             )
             txt_clip = txt_clip.set_position(('center', 'bottom')).set_duration(final_duration)
-            logger.info("Created text overlay")
+            logger.info(f"Created text overlay for {output_path}")
         except Exception as e:
-            logger.error(f"Failed to create text overlay: {str(e)}")
+            logger.error(f"Failed to create text overlay for {output_path}: {str(e)}")
             if "ImageMagick" in str(e):
                 st.error("ImageMagick is not installed or configured correctly. Text overlays will be skipped.")
             txt_clip = None
 
-        if txt_clip:
+        if txt_clip and audio:
             video = mp.CompositeVideoClip([media_clip, txt_clip]).set_audio(audio)
-        else:
+        elif audio:
             video = media_clip.set_audio(audio)
-        
+        elif txt_clip:
+            video = mp.CompositeVideoClip([media_clip, txt_clip])
+        else:
+            video = media_clip
+
         video.write_videofile(
             output_path,
             fps=24,
@@ -383,14 +586,14 @@ def create_video_snippet(media_path, audio_path, output_path, text, duration=8):
             verbose=True,
             logger=None
         )
-        logger.info(f"Created video snippet at {output_path}")
+        logger.info(f"Created video snippet at {output_path}, has audio: {video.audio is not None if 'video' in locals() else 'N/A'}")
         if not os.path.exists(output_path):
             logger.error(f"Video file {output_path} was not created.")
             return False
         return True
     except Exception as e:
-        logger.error(f"Failed to create video snippet: {str(e)}")
-        st.error(f"Failed to create video snippet: {str(e)}")
+        logger.error(f"Failed to create video snippet at {output_path}: {str(e)}")
+        st.error(f"Failed to create video snippet at {output_path}: {str(e)}")
         return False
 
 def concatenate_videos(video_paths, output_path, background_music_path=None):
@@ -419,7 +622,6 @@ def concatenate_videos(video_paths, output_path, background_music_path=None):
             logger=None
         )
         for clip in clips:
-           
             clip.close()
         final_clip.close()
         logger.info(f"Concatenated video saved at {output_path}")
@@ -429,13 +631,50 @@ def concatenate_videos(video_paths, output_path, background_music_path=None):
         st.error(f"Failed to concatenate videos: {str(e)}")
         return False
 
+def record_audio(filename, stop_event: threading.Event, samplerate=44100):
+    audio_data = []
+    
+    def callback(indata, frames, time, status):
+        if not stop_event.is_set():
+            audio_data.append(indata.copy())
+        else:
+            raise sd.StopStream()
+
+    try:
+        with sd.InputStream(samplerate=samplerate, channels=1, dtype=np.int16, callback=callback):
+            st.info("🎙 Recording started...")
+            while not stop_event.is_set():
+                time.sleep(0.1)
+        st.success("✅ Recording completed.")
+        audio_data = np.concatenate(audio_data, axis=0)
+        with wave.open(filename, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(samplerate)
+            wf.writeframes(audio_data.tobytes())
+    except sd.StopStream:
+        pass
+
+def get_gemini_response(input_msg, audio_path, mime_type="audio/wav"):
+    with open(audio_path, "rb") as f:
+        audio = genai.upload_file(f, mime_type=mime_type)
+    response = model.generate_content([audio, input_msg])
+    return response.text
+
 def process_snippet(args):
     i, media_path, segment, output_lang_code, voice = args
     audio_path = os.path.join(TEMP_FOLDER, f"audio_segment_{i}.mp3")
     video_path = os.path.join(TEMP_FOLDER, f"video_segment_{i}.mp4")
+    logger.info(f"Processing snippet {i+1} with media: {media_path}, segment: {segment}")
+    if not os.path.exists(media_path):
+        logger.error(f"Media file does not exist: {media_path}")
+        return None
     if generate_tts_audio(segment, audio_path, output_lang_code, voice):
+        logger.info(f"Generated audio: {audio_path}, exists: {os.path.exists(audio_path)}")
         if create_video_snippet(media_path, audio_path, video_path, segment):
+            logger.info(f"Generated video: {video_path}, exists: {os.path.exists(video_path)}")
             return video_path
+    logger.error(f"Failed to process snippet {i+1} at {media_path}")
     return None
 
 def process_files(media_paths, user_description, output_lang_code, voice="female"):
@@ -463,22 +702,30 @@ def process_files(media_paths, user_description, output_lang_code, voice="female
 def cleanup_temp():
     for folder in [TEMP_FOLDER, EXTRACT_FOLDER, UPLOAD_FOLDER]:
         if os.path.exists(folder):
-            shutil.rmtree(folder)
-            os.makedirs(folder)
+            try:
+                shutil.rmtree(folder)
+                os.makedirs(folder)
+            except PermissionError as e:
+                logger.error(f"Permission denied while deleting {folder}: {str(e)}. Retrying after delay...")
+                time.sleep(2)
+                try:
+                    shutil.rmtree(folder)
+                    os.makedirs(folder)
+                except Exception as e2:
+                    logger.error(f"Failed to delete {folder} after retry: {str(e2)}")
+                    st.warning(f"Could not clean up {folder} due to file lock. Please close any applications using the files and try again.")
 
 def main():
     global db_conn, db_cursor
-    st.title("PicStory: Generate Stories from Images and Videos")
     init_db()
 
-    # Initialize session state variables
     if 'logged_in' not in st.session_state:
         st.session_state.logged_in = False
         st.session_state.user_id = None
-    if 'recording' not in st.session_state:
-        st.session_state.recording = False
+    if 'recording_state' not in st.session_state:
+        st.session_state.recording_state = False
     if 'user_description' not in st.session_state:
-        st.session_state.user_description = "Example description or no description"
+        st.session_state.user_description = "Enter The Description"
     if 'media_paths' not in st.session_state:
         st.session_state.media_paths = None
     if 'story_segments' not in st.session_state:
@@ -508,10 +755,12 @@ def main():
     if 'show_edit_section' not in st.session_state:
         st.session_state.show_edit_section = False
 
+    st.sidebar.markdown("<h3 style='font-size:24px;'>⚙ User Options</h3>", unsafe_allow_html=True)
+
     if not st.session_state.logged_in:
         tab1, tab2 = st.tabs(["Login", "Register"])
         with tab1:
-            st.subheader("Login")
+            st.markdown("<h3 style='font-size:28px;'>🔑 Login</h3>", unsafe_allow_html=True)
             login_username = st.text_input("Username", key="login_username")
             login_password = st.text_input("Password", type="password", key="login_password")
             if st.button("Login"):
@@ -524,7 +773,7 @@ def main():
                 else:
                     st.error("Invalid username or password.")
         with tab2:
-            st.subheader("Register")
+            st.markdown("<h3 style='font-size:28px;'>📝 Register</h3>", unsafe_allow_html=True)
             reg_username = st.text_input("Username", key="reg_username")
             reg_password = st.text_input("Password", type="password", key="reg_password")
             if st.button("Register"):
@@ -533,79 +782,58 @@ def main():
                 else:
                     st.error("Username already exists or registration failed.")
     else:
-        st.sidebar.header("User Options")
+        st.markdown("<h1 style='font-size:44px; font-weight: bold;'>📸 PicStory: Generate Stories from Images and Videos</h1>", unsafe_allow_html=True)
+        
         if st.sidebar.button("Logout"):
             st.session_state.clear()
             st.rerun()
 
-        uploaded_file = st.file_uploader("Upload a ZIP file containing images (.jpg, .jpeg, .png) or videos (.mp4)", type=["zip"])
-        st.write("### Story Description")
-        col1, col2 = st.columns([3, 1])
-        with col1:
+        st.markdown("<h4 style='font-size:22px;'>📁 Upload a ZIP file containing images (.jpg, .jpeg, .png) or videos (Max 10 img 0r video) (.mp4)</h4>", unsafe_allow_html=True)
+        uploaded_file = st.file_uploader("Drag and drop file here", type=["zip"], help="Limit 200MB per file • ZIP")
+
+        st.markdown("<h3 style='font-size:28px;'>📝 Story Description</h3>", unsafe_allow_html=True)
+        cols = st.columns([2, 1])
+        with cols[0]:
             user_description = st.text_area(
-                "Enter a description (optional):",
+                " ",
+                placeholder="Enter The Description",
                 value=st.session_state.user_description,
                 key="user_desc_input",
                 help="You can type a description here or use the microphone to record one."
             )
             st.session_state.user_description = user_description
-        with col2:
-            mic_lang_choice = st.selectbox("Mic Language:", [f"{lang['name']} ({lang['code']})" for lang in SUPPORTED_LANGUAGES.values()], index=0)
+        with cols[1]:
+            mic_lang_choice = st.selectbox("🎙 Mic Language:", [f"{lang['name']} ({lang['code']})" for lang in SUPPORTED_LANGUAGES.values()], index=0)
             mic_lang_code = SUPPORTED_LANGUAGES[[key for key, val in SUPPORTED_LANGUAGES.items() if f"{val['name']} ({val['code']})" == mic_lang_choice][0]]["code"]
-            
-            if st.button("🎤 Start/Stop Recording"):
-                if not st.session_state.recording:
-                    # Start recording
-                    st.session_state.recording = True
-                    st.write(f"<div class='recording-feedback'>Recording in {mic_lang_code}... Click again to stop</div>", unsafe_allow_html=True)
-                    
-                    # Initialize recognizer
-                    recognizer = sr.Recognizer()
-                    st.session_state.audio_data = []
-                    
-                    # We need to run this in a separate thread to keep the UI responsive
-                    def record_audio():
-                        with sr.Microphone() as source:
-                            recognizer.adjust_for_ambient_noise(source, duration=1)
-                            st.session_state.recording = True
-                            while st.session_state.recording:
-                                try:
-                                    audio = recognizer.listen(source, timeout=1, phrase_time_limit=5)
-                                    st.session_state.audio_data.append(audio)
-                                except sr.WaitTimeoutError:
-                                    continue
-                    
-                    import threading
-                    recording_thread = threading.Thread(target=record_audio)
-                    recording_thread.start()
-                else:
-                    # Stop recording
-                    st.session_state.recording = False
-                    st.write("Processing audio...")
-                    
-                    # Process the recorded audio
-                    full_text = ""
-                    for audio_chunk in st.session_state.audio_data:
-                        try:
-                            text = recognizer.recognize_google(audio_chunk, language=mic_lang_code)
-                            full_text += text + " "
-                        except sr.UnknownValueError:
-                            continue
-                        except sr.RequestError as e:
-                            st.error(f"Speech recognition error: {e}")
-                            continue
-                    
-                    if full_text.strip():
-                        st.session_state.user_description = full_text.strip()
-                        st.success("Transcription complete!")
-                    else:
-                        st.error("No speech detected or could not understand the audio.")
-                    
-                    del st.session_state.audio_data
-                    st.rerun()
 
-            if 'user_description' in st.session_state and st.session_state.user_description != "Example description or no description":
-                st.write(f"Transcribed Description: {st.session_state.user_description}")
+            record_label = "🎤 Record Audio" if not st.session_state.recording_state else "🎤 Stop Recording"
+            if st.button(record_label):
+                if not st.session_state.recording_state:
+                    st.session_state.recording_state = True
+                    stop_event = threading.Event()
+                    st.session_state.stop_event = stop_event
+
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+                        temp_path = temp_file.name
+
+                    threading.Thread(target=record_audio, args=(temp_path, stop_event), daemon=True).start()
+                    st.session_state.temp_path = temp_path
+                else:
+                    st.session_state.recording_state = False
+                    st.session_state.stop_event.set()
+
+                    if 'temp_path' in st.session_state:
+                        st.info("Transcribing...")
+                        result = get_gemini_response(f"Transcribe this audio in {mic_lang_code}", st.session_state.temp_path)
+                        if result:
+                            st.session_state.user_description = result.strip()
+                            st.success("Transcription complete!")
+                            st.write(f"Transcribed Description: {st.session_state.user_description}")
+                        else:
+                            st.error("Failed to transcribe audio.")
+                        os.unlink(st.session_state.temp_path)
+                        del st.session_state.temp_path
+                    st.rerun()
 
         language_choice = st.selectbox("Select output language:", [f"{lang['name']} ({lang['code']})" for lang in SUPPORTED_LANGUAGES.values()], index=0)
         output_lang_code = SUPPORTED_LANGUAGES[[key for key, val in SUPPORTED_LANGUAGES.items() if f"{val['name']} ({val['code']})" == language_choice][0]]["code"]
@@ -622,9 +850,7 @@ def main():
                 return
 
             with st.spinner("Processing files and generating story..."):
-                # Clear folders to avoid residual files
                 cleanup_temp()
-
                 file_path = os.path.join(UPLOAD_FOLDER, uploaded_file.name)
                 with open(file_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
@@ -636,8 +862,11 @@ def main():
                     for file in files:
                         file_path = os.path.join(root, file)
                         if file.lower().endswith(('.jpg', '.jpeg', '.png', '.mp4')):
-                            media_paths.append(file_path)
-                            logger.info(f"Found media: {file_path}")
+                            if len(media_paths) < 10:
+                                media_paths.append(file_path)
+                                logger.info(f"Found media: {file_path}")
+                            else:
+                                logger.info(f"Ignoring additional file {file_path} due to 10-file limit.")
                         else:
                             logger.info(f"Ignoring unsupported file: {file}")
 
@@ -679,7 +908,7 @@ def main():
                         segment_in_english = translate_text(segment, target_lang, "en") if target_lang != "en" else segment
                     st.session_state.english_segments.append(segment_in_english)
 
-            st.write("### AI-Generated Story Segments")
+            st.markdown("<h3 style='font-size:28px;'>📜 AI-Generated Story Segments</h3>", unsafe_allow_html=True)
             for i, (segment, english_segment) in enumerate(zip(st.session_state.story_segments, st.session_state.english_segments)):
                 st.write(f"Segment {i+1} (in {target_lang}): {segment}")
                 st.write(f"Segment {i+1} (in English): {english_segment}")
@@ -690,7 +919,7 @@ def main():
                 st.rerun()
 
         if st.session_state.show_edit_section and st.session_state.story_segments:
-            st.write("### Edit Story Segments (in English)")
+            st.markdown("<h3 style='font-size:28px;'>✏ Edit Story Segments (in English)</h3>", unsafe_allow_html=True)
             target_lang = st.session_state.output_lang_code.split('-')[0]
             
             edited_english_segments = []
@@ -718,7 +947,7 @@ def main():
                     st.rerun()
 
         if st.session_state.edited_segments and not st.session_state.show_edit_section:
-            st.write("### Edited Story Segments (in Target Language)")
+            st.markdown("<h3 style='font-size:28px;'>📜 Edited Story Segments (in Target Language)</h3>", unsafe_allow_html=True)
             for i, segment in enumerate(st.session_state.edited_segments):
                 st.write(f"Segment {i+1}: {segment}")
 
@@ -727,7 +956,7 @@ def main():
                 st.rerun()
 
         if st.session_state.show_complete_story and st.session_state.edited_segments:
-            st.write("### Complete Edited Story")
+            st.markdown("<h3 style='font-size:28px;'>📖 Complete Edited Story</h3>", unsafe_allow_html=True)
             complete_story = " ".join(st.session_state.edited_segments)
             st.write(complete_story)
 
@@ -754,7 +983,7 @@ def main():
                     st.session_state.selected_snippets = list(range(len(video_snippets)))
 
         if st.session_state.video_snippets:
-            st.write("### Preview Video Snippets")
+            st.markdown("<h3 style='font-size:28px;'>🎥 Preview Video Snippets</h3>", unsafe_allow_html=True)
             for i, video_path in enumerate(st.session_state.video_snippets):
                 if i in st.session_state.selected_snippets:
                     st.write(f"Snippet {i+1}:")
@@ -773,9 +1002,11 @@ def main():
                         if bg_music_path:
                             with open(bg_music_path, "wb") as f:
                                 f.write(background_music.getbuffer())
+                            if not os.path.exists(bg_music_path):
+                                st.error(f"Background music file {bg_music_path} was not saved correctly.")
                         success = concatenate_videos(final_snippets, final_video_path, bg_music_path)
                         if success:
-                            st.write("### Final Concatenated Video:")
+                            st.markdown("<h3 style='font-size:28px;'>🎬 Final Concatenated Video:</h3>", unsafe_allow_html=True)
                             with open(final_video_path, "rb") as final_video:
                                 st.video(final_video, format="video/mp4")
                             with open(final_video_path, "rb") as file:
@@ -785,8 +1016,7 @@ def main():
                                     file_name="final_story.mp4",
                                     mime="video/mp4"
                                 )
-                            cleanup_temp()
-
+                            time.sleep(2)
                             try:
                                 db_cursor.executemany(
                                     'INSERT INTO stories (user_id, user_text, detected_lang, output_lang, video_path) VALUES (%s, %s, %s, %s, %s)',
@@ -798,15 +1028,11 @@ def main():
                             except mysql.connector.Error as e:
                                 logger.error(f"Failed to save to database: {e}")
                                 st.error(f"Failed to save to database: {e}")
+                            cleanup_temp()
                         else:
                             st.error("Failed to concatenate videos. Please check the logs for details.")
             else:
                 st.warning("No snippets selected. Please keep at least one snippet to concatenate.")
 
 if __name__ == "__main__":
-    try:
-        import keyboard
-    except ImportError:
-        print("Please install the 'keyboard' module: pip install keyboard")
-        exit()
     main()
